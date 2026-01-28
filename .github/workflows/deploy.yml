@@ -1,0 +1,30 @@
+name: Deploy FinOps Agent
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  id-token: write   # OIDC
+  contents: read    # Checkout
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::503532613196:role/GitHubActionsDeployRoleY1BQS
+          aws-region: us-east-1
+
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --stack-name finops-agent \
+            --template-file cfn-finops-bedrock-multiagent-nova.yaml \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
