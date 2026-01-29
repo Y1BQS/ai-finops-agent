@@ -26,6 +26,36 @@ Parameters:
     AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     ConstraintDescription: 'Must be a valid email address'
 
+  EnvironmentName:
+    Type: String
+    Description: 'Environment identifier (e.g. sandbox, audit, management). Used in resource naming and email subject.'
+    Default: sandbox
+    AllowedValues:
+      - sandbox
+      - audit
+      - management
+    ConstraintDescription: 'Must be sandbox, audit, or management'
+
+  ReportRecipientEmails:
+    Type: CommaDelimitedList
+    Description: 'Email addresses to receive daily and weekly cloud reports (SES). Must be verified in SES if account is in sandbox.'
+    Default: ''
+
+  DailyReportSchedule:
+    Type: String
+    Description: 'EventBridge cron expression for daily report (UTC). Default 08:00 UTC daily.'
+    Default: 'cron(0 8 * * ? *)'
+
+  WeeklyReportSchedule:
+    Type: String
+    Description: 'EventBridge cron expression for weekly report (UTC). Default Monday 09:00 UTC.'
+    Default: 'cron(0 9 ? * MON *)'
+
+  SESFromEmail:
+    Type: String
+    Description: 'Verified sender email address for SES. This identity must be verified in the same account/region before reports will send.'
+    Default: ''
+
 Resources:
   LambdaRole:
     Type: AWS::IAM::Role
@@ -79,6 +109,36 @@ Resources:
                   - eks:ListNodegroups
                 Resource: '*'
   
+  ReportOrchestratorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReportOrchestratorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:agent-alias/${AgentId}/TSTALIASID'
+                    - { AgentId: !Ref SupervisorAgent }
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
   BedrockAgentExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -131,6 +191,8 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${SubAgentFoundationModel}'
                   - !GetAtt CostAnalysisAgentAlias.AgentAliasArn
                   - !GetAtt CostOptimizationAgentAlias.AgentAliasArn
+                  - !GetAtt HygieneAgentAlias.AgentAliasArn
+                  - !GetAtt SecurityAgentAlias.AgentAliasArn
         - PolicyName: AmazonBedrockAgentInferenceProfilesCrossRegionPolicy
           PolicyDocument:
             Version: "2012-10-17"
@@ -319,6 +381,36 @@ Resources:
                     Description: Optional list or comma-separated string of AWS regions to scan. Default is current region if omitted.
                     Required: false
                     Type: string
+                RequireConfirmation: DISABLED
+
+  SecurityAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref SecurityAgent
+      AgentAliasName: "Security"
+      Description: "Agent to return Trusted Advisor security findings"
+
+  SecurityAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: SecurityAgent
+      Description: Returns Trusted Advisor security pillar findings only.
+      Instruction: |
+        "You return Trusted Advisor security findings only. Call your action group to get data; never infer or fabricate.
+        Always present: check name, description, resource count, recommended action. Format as clear sections."
+      AutoPrepare: true
+      AgentResourceRoleArn: !GetAtt BedrockAgentExecutionRole.Arn
+      IdleSessionTTLInSeconds: 1800
+      FoundationModel: !Ref SubAgentFoundationModel
+      ActionGroups:
+        - ActionGroupName: TrustedAdvisorSecurityRecommendations
+          Description: Gets Trusted Advisor security pillar recommendations
+          ActionGroupExecutor:
+            Lambda: !GetAtt TrustedAdvisorSecurityRecommendations.Arn
+          FunctionSchema:
+            Functions:
+              - Name: GetSecurityFindings
+                Description: Returns all security recommendations from Trusted Advisor
                 RequireConfirmation: DISABLED
 
   CostAnalysisAgentAlias:
@@ -1054,7 +1146,9 @@ Resources:
 
   SupervisorAgent:
     Type: AWS::Bedrock::Agent
-    DependsOn: CostAnalysisAgentAlias
+    DependsOn:
+      - CostAnalysisAgentAlias
+      - SecurityAgentAlias
     Properties:
       AgentName: FinOpsSupervisorAgent
       Description: You are an AI Agent which will get FinOps Data.
@@ -1065,6 +1159,7 @@ Resources:
         CostAnalysisAgent: Handles date calculation, detailed cost breakdowns, historical analysis and forecast analysis
         CostOptimizationAgent: Provides optimization recommendations and savings opportunities
         HygieneAgent: Performs infrastructure hygiene scans to find unused resources and waste
+        SecurityAgent: Returns Trusted Advisor security pillar findings (security issues, vulnerabilities, recommendations)
 
         Core Capabilities
         Route cost-related queries to appropriate specialist agents
@@ -1123,6 +1218,12 @@ Resources:
         - Questions about infrastructure hygiene
         - Queries like 'find waste', 'check hygiene', 'what can be cleaned up?'
         - Requests for a hygiene report or unused resource inventory
+
+        Route to SecurityAgent when:
+        - Security issues, vulnerabilities, Trusted Advisor security findings
+        - Security recommendations or security checklist requests
+
+        For daily or weekly report requests: Call CostOptimizationAgent, SecurityAgent, and HygieneAgent; combine their outputs into one formatted report with clear sections (Cost optimization, Security issues, Hygiene). Do not include internal reasoning; output only the final report.
 
         Route to Multiple Agents when:
         Complex queries requiring both historical analysis and optimization
@@ -1203,6 +1304,11 @@ Resources:
           CollaborationInstruction: "- Questions about unused resources, idle infrastructure, or hygiene\n          - Requests to scan for waste, hygiene issues, or clean-up opportunities\n          - Queries like 'scan for unused resources', 'check hygiene', or 'what can be cleaned up?'"
           CollaboratorName: HygieneAgent
           RelayConversationHistory: TO_COLLABORATOR
+        - AgentDescriptor:
+            AliasArn: !GetAtt SecurityAgentAlias.AgentAliasArn
+          CollaborationInstruction: "- Security issues, vulnerabilities, Trusted Advisor security findings\n          - Security recommendations or security checklist requests"
+          CollaboratorName: SecurityAgent
+          RelayConversationHistory: TO_COLLABORATOR
 
   DateTimeLambdaPermission:
     Type: AWS::Lambda::Permission
@@ -1262,7 +1368,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: HygieneScannerLambda
-      Handler: main.lambda_handler
+      Handler: index.lambda_handler
       Role: !GetAtt LambdaRole.Arn
       Runtime: python3.12
       Code:
@@ -1630,6 +1736,107 @@ Resources:
       Principal: bedrock.amazonaws.com
       SourceArn: !GetAtt HygieneAgent.AgentArn
 
+  TrustedAdvisorSecurityLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: SecurityAgent
+    Properties:
+      FunctionName: !Ref TrustedAdvisorSecurityRecommendations
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !GetAtt SecurityAgent.AgentArn
+
+  ReportOrchestratorLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: SupervisorAgent
+    Properties:
+      FunctionName: !Sub 'cloud-report-orchestrator-${EnvironmentName}'
+      Handler: index.lambda_handler
+      Role: !GetAtt ReportOrchestratorLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          AGENT_ID: !Ref SupervisorAgent
+          AGENT_ALIAS_ID: TSTALIASID
+          REPORT_RECIPIENTS: !Join [',', !Ref ReportRecipientEmails]
+          SES_FROM_EMAIL: !Ref SESFromEmail
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+
+          def lambda_handler(event, context):
+              recipients = (os.environ.get("REPORT_RECIPIENTS") or "").strip().split(",")
+              recipients = [r.strip() for r in recipients if r.strip()]
+              from_email = (os.environ.get("SES_FROM_EMAIL") or "").strip()
+              if not recipients or not from_email:
+                  print("ReportRecipientEmails or SESFromEmail not set; skipping report.")
+                  return {"status": "skipped", "reason": "missing_config"}
+              report_type = "weekly"
+              try:
+                  detail = event.get("detail") or {}
+                  if isinstance(detail, str):
+                      detail = json.loads(detail) if detail else {}
+                  report_type = detail.get("reportType", "daily")
+              except Exception:
+                  pass
+              if report_type not in ("daily", "weekly"):
+                  report_type = "daily"
+              agent_id = os.environ.get("AGENT_ID")
+              agent_alias_id = os.environ.get("AGENT_ALIAS_ID", "TSTALIASID")
+              env_name = os.environ.get("ENVIRONMENT_NAME", "sandbox")
+              prompt = f"Generate a {report_type} cloud report for this AWS account. Include: 1) Cost optimization opportunities (use CostOptimizationAgent). 2) Security issues from Trusted Advisor (use SecurityAgent). 3) Hygiene findings – unused EBS, snapshots, EIPs, idle NAT/ALB, empty log groups (use HygieneAgent). Format as clear sections with bullet points. Do not include internal reasoning; output only the final report."
+              client = boto3.client("bedrock-agent-runtime")
+              session_id = str(uuid.uuid4())
+              response = client.invoke_agent(agentId=agent_id, agentAliasId=agent_alias_id, sessionId=session_id, inputText=prompt)
+              completion = ""
+              for event_stream in response.get("completion", []):
+                  if "chunk" in event_stream and event_stream["chunk"].get("bytes"):
+                      completion += event_stream["chunk"]["bytes"].decode("utf-8", errors="replace")
+              if not completion.strip():
+                  completion = "(No report content generated.)"
+              body_html = f"<html><body><pre style='white-space:pre-wrap;font-family:sans-serif;'>{completion}</pre></body></html>"
+              ses = boto3.client("ses")
+              subject = f"[{env_name}] AWS Cloud Report – {report_type.capitalize()}"
+              ses.send_email(Source=from_email, Destinations=recipients, Message={"Subject": {"Data": subject, "Charset": "UTF-8"}, "Body": {"Html": {"Data": body_html, "Charset": "UTF-8"}}})
+              return {"status": "sent", "reportType": report_type, "recipientCount": len(recipients)}
+
+  ReportOrchestratorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReportOrchestratorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/*'
+
+  DailyReportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'cloud-report-daily-${EnvironmentName}'
+      Description: Triggers daily cloud report
+      ScheduleExpression: !Ref DailyReportSchedule
+      State: ENABLED
+      Targets:
+        - Id: ReportOrchestratorDaily
+          Arn: !GetAtt ReportOrchestratorLambda.Arn
+          Input: '{"detail":{"reportType":"daily"}}'
+
+  WeeklyReportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'cloud-report-weekly-${EnvironmentName}'
+      Description: Triggers weekly cloud report
+      ScheduleExpression: !Ref WeeklyReportSchedule
+      State: ENABLED
+      Targets:
+        - Id: ReportOrchestratorWeekly
+          Arn: !GetAtt ReportOrchestratorLambda.Arn
+          Input: '{"detail":{"reportType":"weekly"}}'
+
   # Lambda Function 1: TrustedAdvisorListRecommendationResources
   TrustedAdvisorListRecommendationResources:
     Type: AWS::Lambda::Function
@@ -1986,6 +2193,86 @@ Resources:
               }
           });      
       Description: 'Lambda function to lit TA resources'
+      Timeout: 100
+      MemorySize: 128
+
+  # Lambda: Trusted Advisor Security pillar recommendations
+  TrustedAdvisorSecurityRecommendations:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TrustedAdvisorSecurityRecommendations
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs20.x
+      Code:
+        ZipFile: |
+          const { Readable } = require('stream');
+          const { TrustedAdvisorClient, ListRecommendationsCommand, GetRecommendationCommand } = require("@aws-sdk/client-trustedadvisor");
+          const client = new TrustedAdvisorClient({});
+          const CHUNK_SIZE = 25 * 1024;
+          const streamFunctionResponse = async (function_response, responseStream) => {
+            const jsonResponse = JSON.stringify(function_response);
+            const requestStream = Readable.from(jsonResponse);
+            for await (const chunk of requestStream) {
+              if (chunk.length > CHUNK_SIZE) {
+                for (let i = 0; i < chunk.length; i += CHUNK_SIZE) {
+                  await responseStream.write(chunk.slice(i, i + CHUNK_SIZE));
+                }
+              } else {
+                await responseStream.write(chunk);
+              }
+            }
+            responseStream.end();
+          };
+          module.exports.handler = awslambda.streamifyResponse(async (event, responseStream, context) => {
+            try {
+              responseStream.setContentType("application/json");
+              const get_security_findings = async () => {
+                const findings = [];
+                let nextToken = undefined;
+                do {
+                  const input = { maxResults: 200, pillar: "security", status: "warning" };
+                  if (nextToken) input.nextToken = nextToken;
+                  const response = await client.send(new ListRecommendationsCommand(input));
+                  for (const rec of response.recommendationSummaries || []) {
+                    try {
+                      const detail = await client.send(new GetRecommendationCommand({ recommendationIdentifier: rec.arn }));
+                      const resourceAggregates = rec.resourcesAggregates || {};
+                      findings.push({
+                        recommendationIdentifier: rec.arn,
+                        checkName: rec.name,
+                        checkId: rec.id,
+                        status: rec.status,
+                        description: detail.recommendation?.description || '',
+                        recommendedAction: detail.recommendation?.recommendedActions?.[0]?.description || '',
+                        resourceCount: resourceAggregates.errorCount + resourceAggregates.warningCount,
+                        resources: detail.recommendation?.resources?.map(r => ({ resourceId: r.resourceId || '', region: r.metadata?.region || '', status: r.status, metadata: r.metadata || {} })) || []
+                      });
+                    } catch (e) {
+                      console.error("Error processing recommendation:", rec.name, e);
+                    }
+                  }
+                  nextToken = response.nextToken;
+                } while (nextToken);
+                return findings;
+              };
+              const findings = await get_security_findings();
+              const checks = { summary: { totalFindings: findings.length, lastUpdated: new Date().toISOString().replace('T', ' ').substr(0, 19) }, findings };
+              const function_response = {
+                messageVersion: "1.0",
+                response: { actionGroup: event.actionGroup || '', function: event.function, functionResponse: { responseBody: { TEXT: { body: JSON.stringify({ checks }) } } } }
+              };
+              await streamFunctionResponse(function_response, responseStream);
+            } catch (e) {
+              console.error("Unexpected error:", e);
+              const error_response = {
+                messageVersion: "1.0",
+                response: { actionGroup: event.actionGroup || '', function: event.function, responseState: 'REPROMPT', functionResponse: { responseBody: { TEXT: { body: JSON.stringify({ error: e.message }) } } } }
+              };
+              await streamFunctionResponse(error_response, responseStream);
+            }
+          });
+      Description: 'Lambda to return Trusted Advisor security pillar recommendations'
       Timeout: 100
       MemorySize: 128
 
