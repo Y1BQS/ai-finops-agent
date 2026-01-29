@@ -1,0 +1,11 @@
+template-file-path: cfn-finops-bedrock-multiagent-nova.yaml
+parameters:
+  ReportRecipientEmails: hamza.khan@nscorp.com,khanhamza2293@gmail.com
+  EnvironmentName: sandbox
+  WeeklyReportSchedule: cron(0 9 ? * MON *)
+  SubAgentFoundationModel: amazon.nova-micro-v1:0
+  UserEmail: hamza.khan@nscorp.com
+  SupervisorFoundationModel: amazon.nova-pro-v1:0
+  DailyReportSchedule: cron(0 8 * * ? *)
+  SESFromEmail: hamza.khan@nscorp.com
+tags: {}
