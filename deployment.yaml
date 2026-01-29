@@ -1,0 +1,16 @@
+# CloudFormation Git sync stack deployment file
+# See: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/git-sync-concepts-terms.html#git-sync-concepts-terms-depoyment-file
+
+template-file-path: cfn-finops-bedrock-multiagent-nova.yaml
+
+parameters:
+  SupervisorFoundationModel: amazon.nova-pro-v1:0
+  SubAgentFoundationModel: amazon.nova-micro-v1:0
+  EnvironmentName: sandbox
+  UserEmail: user@example.com   # Required: set to your FinOps user email
+  ReportRecipientEmails: ''
+  DailyReportSchedule: 'cron(0 8 * * ? *)'
+  WeeklyReportSchedule: 'cron(0 9 ? * MON *)'
+  SESFromEmail: reports@example.com   # Required for reports: set to your verified SES sender
+
+tags: {}
